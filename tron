@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""
+Airseekers Tron CLI - Control your robot mower from the command line.
+"""
+
+import asyncio
+import argparse
+import json
+import sys
+import os
+from datetime import datetime, timezone, timedelta
+
+import aiohttp
+
+# Add parent dir for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from api_client import AirseekersAPI
+
+AEST = timezone(timedelta(hours=11))
+
+TASK_STATES = {0: "Idle", 1: "Mowing", 2: "Returning", 3: "Docked", 4: "Paused", 5: "Error"}
+TASK_TYPES = {0: "None", 1: "Auto Mow", 2: "Manual", 3: "Scheduled"}
+
+
+def format_time(ts):
+    """Format unix timestamp to readable AEST."""
+    if not ts:
+        return "Unknown"
+    return datetime.fromtimestamp(ts, tz=AEST).strftime("%Y-%m-%d %H:%M:%S AEDT")
+
+def format_lock_status(status):
+    return {0: "🔓 Unlocked", 1: "🔒 Locked", 2: "🔓 Unlocked"}.get(status, f"Unknown ({status})")
+
+def format_online(status):
+    if isinstance(status, bool):
+        return "🟢 Online" if status else "⚫ Offline"
+    return {0: "⚫ Offline", 1: "🟢 Online"}.get(status, f"Unknown ({status})")
+
+
+class TronCLI:
+    def __init__(self, email, password):
+        self.email = email
+        self.password = password
+        self.session = None
+        self.api = None
+        self._sn = None
+
+    async def connect(self):
+        self.session = aiohttp.ClientSession()
+        self.api = AirseekersAPI(self.email, self.password, session=self.session)
+        await self.api.get_server_host()
+        await self.api.login()
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+    async def get_device(self):
+        """Get first device."""
+        devices = await self.api.get_devices()
+        if not devices.list:
+            print("❌ No devices found")
+            return None
+        self._sn = devices.list[0]['sn']
+        return devices.list[0]
+
+    async def get_sn(self):
+        if not self._sn:
+            device = await self.get_device()
+            if not device:
+                return None
+        return self._sn
+
+    async def cmd_status(self, args):
+        """Show full mower status."""
+        device = await self.get_device()
+        if not device:
+            return
+
+        sn = device['sn']
+        resp = await self.api._make_request("GET", f"/api/web/device/full-status?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ Failed to get status: {resp.msg}")
+            return
+
+        d = resp.data
+
+        # Battery
+        bat = d.get('battery_status', {})
+        # Network
+        net = d.get('net_info', {})
+        # Online
+        online = d.get('online_status', {})
+        # RTK
+        rtk = d.get('rtk_status', {})
+        # Task
+        task = d.get('task_status', {})
+        # Version
+        ver = d.get('version', {})
+        # Config
+        cfg_resp = await self.api._make_request("GET", f"/api/web/device/config?sn={sn}")
+        cfg = cfg_resp.data.get('configs', {}) if cfg_resp.code == 0 else {}
+
+        task_state = TASK_STATES.get(task.get('state'), f"Unknown ({task.get('state')})")
+        task_type = TASK_TYPES.get(task.get('type'), f"Unknown ({task.get('type')})")
+
+        print("🤖 Airseekers Tron — Full Status")
+        print("=" * 50)
+
+        print(f"\n📡 Connection")
+        print(f"  Status:         {format_online(online.get('status', False))}")
+        print(f"  WiFi SSID:      {net.get('wifi_ssid', 'N/A')}")
+        print(f"  WiFi IP:        {net.get('wifi_ip', 'N/A')}")
+        print(f"  WiFi Signal:    {net.get('wifi_dbm', 'N/A')} dBm")
+        print(f"  4G IP:          {net.get('wireless_4g_ip', 'N/A')}")
+        print(f"  SIM (ICCID):    {net.get('sim_iccid', 'N/A')}")
+
+        print(f"\n🔋 Battery")
+        print(f"  Charge:         {bat.get('battery_percentage', '?')}%")
+        print(f"  Temperature:    {bat.get('battery_temperature', '?')}°C")
+        print(f"  Error:          {'None' if bat.get('battery_error') == 0 else bat.get('battery_error')}")
+
+        print(f"\n📍 GPS / RTK")
+        print(f"  Fix Type:       {rtk.get('rtk_status', 'N/A')}")
+        print(f"  Satellites:     {rtk.get('num_satellites_used', '?')}/{rtk.get('num_satellites', '?')}")
+        print(f"  Latitude:       {rtk.get('robot_pose_lat', 'N/A')}")
+        print(f"  Longitude:      {rtk.get('robot_pose_lon', 'N/A')}")
+        print(f"  Heading (yaw):  {rtk.get('robot_pose_yaw', 'N/A')}")
+        print(f"  LoRa Signal:    {rtk.get('lora_rssi_dbm', 'N/A')} dBm")
+
+        print(f"\n🌿 Task")
+        print(f"  State:          {task_state}")
+        print(f"  Type:           {task_type}")
+        print(f"  Started:        {task.get('start_time', 'N/A')}")
+        print(f"  Run Time:       {task.get('run_time', 'N/A')}")
+        print(f"  Area Done:      {task.get('total_area', 0)} m²")
+        print(f"  Area Left:      {task.get('remaining_area', 0)} m²")
+
+        print(f"\n⚙️  Config")
+        print(f"  Lock:           {format_lock_status(int(cfg.get('DeviceLock', '0')))}")
+        print(f"  Volume:         {cfg.get('SetVolume', '?')}%")
+        print(f"  Light:          {cfg.get('SetLightBrightness', '?')}%")
+        print(f"  NRTK:           {'Enabled' if cfg.get('EnableNRTK') == '1' else 'Disabled'}")
+        print(f"  Dark Mode:      {cfg.get('SetDarkMode', 'Off') or 'Off'}")
+
+        print(f"\n🔧 Firmware")
+        print(f"  Package:        {ver.get('mower_package', 'N/A')}")
+        print(f"  Chassis:        {ver.get('chassis_board', 'N/A')}")
+        print(f"  Cutter:         {ver.get('cutter_board', 'N/A')}")
+        print(f"  RTK Board:      {ver.get('rtk_board', 'N/A')}")
+        print(f"  Voice:          {ver.get('voice_language', 'N/A')}")
+
+        print(f"\n🆔 Device")
+        print(f"  SN:             {sn}")
+        print(f"  Device ID:      {device['id']}")
+
+    async def cmd_battery(self, args):
+        """Show battery status."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("GET", f"/api/web/device/full-status?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ {resp.msg}")
+            return
+        bat = resp.data.get('battery_status', {})
+        pct = bat.get('battery_percentage', 0)
+        temp = bat.get('battery_temperature', '?')
+        bars = '█' * (pct // 5) + '░' * (20 - pct // 5)
+        print(f"🔋 [{bars}] {pct}%  ({temp}°C)")
+
+    async def cmd_gps(self, args):
+        """Show GPS location."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("GET", f"/api/web/device/full-status?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ {resp.msg}")
+            return
+        rtk = resp.data.get('rtk_status', {})
+        lat = rtk.get('robot_pose_lat', 0)
+        lon = rtk.get('robot_pose_lon', 0)
+        print(f"📍 GPS Position")
+        print(f"  Lat:        {lat}")
+        print(f"  Lon:        {lon}")
+        print(f"  Fix:        {rtk.get('rtk_status', 'N/A')}")
+        print(f"  Satellites: {rtk.get('num_satellites_used', '?')}/{rtk.get('num_satellites', '?')}")
+        if lat and lon:
+            print(f"\n  🗺️  https://www.google.com/maps?q={lat},{lon}")
+
+    async def cmd_task_start(self, args):
+        """Start mowing task."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("POST", "/api/web/device/task/start", {"sn": sn})
+        if resp.code == 0:
+            print("🌿 Mowing started!")
+        else:
+            print(f"❌ Start failed: {resp.msg}")
+
+    async def cmd_task_stop(self, args):
+        """Stop mowing task."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("POST", "/api/web/device/task/stop", {"sn": sn})
+        if resp.code == 0:
+            print("🛑 Mowing stopped")
+        else:
+            print(f"❌ Stop failed: {resp.msg}")
+
+    async def cmd_task_pause(self, args):
+        """Pause mowing task."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("POST", "/api/web/device/task/pause", {"sn": sn})
+        if resp.code == 0:
+            print("⏸️  Mowing paused")
+        else:
+            print(f"❌ Pause failed: {resp.msg}")
+
+    async def cmd_task_resume(self, args):
+        """Resume mowing task."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("POST", "/api/web/device/task/resume", {"sn": sn})
+        if resp.code == 0:
+            print("▶️  Mowing resumed")
+        else:
+            print(f"❌ Resume failed: {resp.msg}")
+
+    async def cmd_dock(self, args):
+        """Send mower back to dock."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("POST", "/api/web/device/task/dock", {"sn": sn})
+        if resp.code == 0:
+            print("🏠 Returning to dock")
+        else:
+            print(f"❌ Dock failed: {resp.msg}")
+
+    async def cmd_lock(self, args):
+        """Lock the mower."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("POST", "/api/web/device/lock", {"sn": sn})
+        if resp.code == 0:
+            print("🔒 Mower locked")
+        else:
+            print(f"❌ Lock failed: {resp.msg}")
+
+    async def cmd_unlock(self, args):
+        """Unlock the mower."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("POST", "/api/web/device/unlock", {"sn": sn})
+        if resp.code == 0:
+            print("🔓 Mower unlocked")
+        else:
+            print(f"❌ Unlock failed: {resp.msg}")
+
+    async def cmd_history(self, args):
+        """Show task history."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("GET", f"/api/web/device/task-record/list?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ {resp.msg}")
+            return
+
+        records = resp.data if isinstance(resp.data, list) else resp.data.get('list', []) if isinstance(resp.data, dict) else []
+        limit = args.limit or 10
+        print(f"📋 Task History (last {limit})")
+        print("=" * 50)
+        for r in records[:limit]:
+            print(json.dumps(r, indent=2))
+            print()
+
+    async def cmd_maps(self, args):
+        """List maps."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("GET", f"/api/web/device/map?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ Failed to get maps: {resp.msg}")
+            return
+        maps = resp.data if isinstance(resp.data, list) else []
+        print(f"🗺️  Maps ({len(maps)} found)")
+        print("=" * 40)
+        for m in maps:
+            print(f"  ID:   {m['mapId']}")
+            print(f"  Name: {m.get('nick_name', m.get('mapName', 'Unknown'))}")
+            geo = m.get('geoData', {})
+            features = geo.get('features', [])
+            print(f"  Features: {len(features)}")
+            for i, f in enumerate(features):
+                geom = f.get('geometry', {})
+                coords = geom.get('coordinates', [])
+                print(f"    [{i}] {len(coords)} points")
+            print()
+
+    async def cmd_map_export(self, args):
+        """Export map data to JSON."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("GET", f"/api/web/device/map?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ Failed to get maps: {resp.msg}")
+            return
+        outfile = args.output or f"tron_map_{sn}.json"
+        with open(outfile, 'w') as f:
+            json.dump(resp.data, f, indent=2)
+        print(f"✅ Map data exported to {outfile}")
+
+    async def cmd_config(self, args):
+        """Show or set config."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+
+        if args.set_key and args.set_value:
+            resp = await self.api._make_request("POST", "/api/web/device/config", {
+                "sn": sn, "key": args.set_key, "value": args.set_value
+            })
+            if resp.code == 0:
+                print(f"✅ Set {args.set_key} = {args.set_value}")
+            else:
+                print(f"❌ {resp.msg}")
+            return
+
+        resp = await self.api._make_request("GET", f"/api/web/device/config?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ {resp.msg}")
+            return
+        print("⚙️  Config")
+        print("=" * 40)
+        for k, v in resp.data.get('configs', {}).items():
+            print(f"  {k}: {v}")
+
+    async def cmd_notifications(self, args):
+        """Show notifications."""
+        sn = await self.get_sn()
+        if not sn:
+            return
+        resp = await self.api._make_request("GET", f"/api/web/device/notify/list?sn={sn}")
+        if resp.code != 0:
+            print(f"❌ {resp.msg}")
+            return
+        print("🔔 Notifications")
+        print("=" * 40)
+        data = resp.data
+        if isinstance(data, list):
+            for n in data[:20]:
+                print(json.dumps(n, indent=2))
+        else:
+            print(json.dumps(data, indent=2))
+
+    async def cmd_raw(self, args):
+        """Make a raw API request."""
+        method = args.method.upper()
+        endpoint = args.endpoint
+        data = json.loads(args.data) if args.data else None
+        if data:
+            resp = await self.api._make_request(method, endpoint, data)
+        else:
+            resp = await self.api._make_request(method, endpoint)
+        print(f"Code: {resp.code} | Msg: {resp.msg}")
+        if resp.data:
+            print(json.dumps(resp.data, indent=2))
+
+    async def cmd_mqtt_info(self, args):
+        """Show MQTT connection info."""
+        certs = await self.api.get_iot_certificates()
+        print("📡 MQTT Connection Info")
+        print("=" * 40)
+        print(f"  Broker:      {certs.mqtt_broker}")
+        print(f"  Client ID:   {certs.mqtt_client_id}")
+        print(f"  CA cert:     {len(certs.ca)} bytes")
+        print(f"  Client cert: {len(certs.cert_key)} bytes")
+        print(f"  Private key: {len(certs.private_key)} bytes")
+        if args.export:
+            os.makedirs(args.export, exist_ok=True)
+            for name, content in [("ca.crt", certs.ca), ("cert.pem", certs.cert_key), ("key.pem", certs.private_key)]:
+                with open(os.path.join(args.export, name), 'w') as f:
+                    f.write(content)
+            with open(os.path.join(args.export, "mqtt_config.json"), 'w') as f:
+                json.dump({"broker": certs.mqtt_broker, "client_id": certs.mqtt_client_id}, f, indent=2)
+            print(f"\n✅ Certificates exported to {args.export}/")
+
+    async def cmd_watch(self, args):
+        """Poll mower status every N seconds."""
+        interval = args.interval or 30
+        print(f"👀 Watching mower status (every {interval}s, Ctrl+C to stop)\n")
+        sn = await self.get_sn()
+        if not sn:
+            return
+        try:
+            while True:
+                resp = await self.api._make_request("GET", f"/api/web/device/full-status?sn={sn}")
+                if resp.code == 0:
+                    d = resp.data
+                    ts = datetime.now(tz=AEST).strftime("%H:%M:%S")
+                    online = "🟢" if d.get('online_status', {}).get('status') else "⚫"
+                    bat = d.get('battery_status', {}).get('battery_percentage', '?')
+                    task = d.get('task_status', {})
+                    state = TASK_STATES.get(task.get('state'), '?')
+                    rtk = d.get('rtk_status', {})
+                    sats = rtk.get('num_satellites_used', '?')
+                    fix = rtk.get('rtk_status', '?')
+                    net = d.get('net_info', {})
+                    wifi = net.get('wifi_dbm', '?')
+                    print(f"[{ts}] {online} 🔋{bat}% 🌿{state} 📡{fix}({sats}sat) WiFi:{wifi}dBm")
+                await asyncio.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n👋 Stopped watching")
+
+    async def cmd_endpoints(self, args):
+        """List all known API endpoints."""
+        endpoints = [
+            ("GET",  "/api/web/device", "List devices"),
+            ("GET",  "/api/web/device/full-status?sn=SN", "Full device status"),
+            ("GET",  "/api/web/device/config?sn=SN", "Device config"),
+            ("GET",  "/api/web/device/map?sn=SN", "Maps"),
+            ("GET",  "/api/web/device/map/v2?sn=SN", "Maps v2"),
+            ("GET",  "/api/web/device/task?sn=SN", "Current task"),
+            ("GET",  "/api/web/device/task/latest?sn=SN", "Latest task"),
+            ("GET",  "/api/web/device/task-record/list?sn=SN", "Task history"),
+            ("GET",  "/api/web/device/notify/list?sn=SN", "Notifications"),
+            ("GET",  "/api/web/firmware/latest", "Latest firmware"),
+            ("GET",  "/api/web/app-version/latest", "Latest app version"),
+            ("GET",  "/api/web/device/iot-cert", "MQTT certificates"),
+            ("GET",  "/api/web/user", "User info"),
+            ("POST", "/api/web/device/task/start", "Start mowing"),
+            ("POST", "/api/web/device/task/stop", "Stop mowing"),
+            ("POST", "/api/web/device/task/pause", "Pause mowing"),
+            ("POST", "/api/web/device/task/resume", "Resume mowing"),
+            ("POST", "/api/web/device/task/dock", "Return to dock"),
+            ("POST", "/api/web/device/lock", "Lock mower"),
+            ("POST", "/api/web/device/unlock", "Unlock mower"),
+            ("POST", "/api/web/device/config", "Set config"),
+            ("POST", "/api/web/device/bind", "Bind device"),
+            ("POST", "/api/web/device/unbind", "Unbind device"),
+            ("POST", "/api/web/device/factory-reset", "Factory reset"),
+            ("POST", "/api/web/device/rtk-reboot", "Reboot RTK"),
+            ("GET",  "/api/web/device/rtk/address-info", "RTK address info"),
+            ("GET",  "/api/web/live/camera-params?sn=SN", "Live camera params"),
+            ("POST", "/api/web/live/open", "Open live stream"),
+            ("POST", "/api/web/live/move-control", "Manual move control"),
+            ("POST", "/api/web/live/heartbeat", "Live session heartbeat"),
+            ("GET",  "/api/web/device/map/geo-data", "Map geo data"),
+            ("POST", "/api/web/device/map/nick-name", "Rename map"),
+            ("POST", "/api/web/device/map/switch", "Switch active map"),
+            ("POST", "/api/web/device/find-lock-password", "Find lock password"),
+            ("POST", "/api/web/device/clean-warn", "Clear warnings"),
+        ]
+        print("📋 Known API Endpoints")
+        print("=" * 70)
+        for method, path, desc in endpoints:
+            print(f"  {method:4s}  {path:45s}  {desc}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="🤖 Airseekers Tron CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  status           Full mower status (battery, GPS, task, config, firmware)
+  battery          Battery level
+  gps              GPS position with Google Maps link
+  start            Start mowing
+  stop             Stop mowing
+  pause            Pause mowing
+  resume           Resume mowing
+  dock             Return to dock
+  lock             Lock mower
+  unlock           Unlock mower
+  config           Show config (or set with --key/--value)
+  maps             List maps
+  map-export       Export map data to JSON
+  history          Task history
+  notifications    Show notifications
+  watch            Live status polling
+  mqtt-info        MQTT broker info
+  endpoints        List all known API endpoints
+  raw              Raw API request
+
+Examples:
+  tron status
+  tron battery
+  tron gps
+  tron start
+  tron stop
+  tron dock
+  tron watch -i 10
+  tron config --key SetVolume --value 50
+  tron raw GET /api/web/device/full-status?sn=YOUR_SN
+        """
+    )
+
+    parser.add_argument('--email', default=os.environ.get('AIRSEEKERS_EMAIL'),
+                        help='Airseekers account email (or AIRSEEKERS_EMAIL env)')
+    parser.add_argument('--password', default=os.environ.get('AIRSEEKERS_PASSWORD'),
+                        help='Airseekers account password (or AIRSEEKERS_PASSWORD env)')
+
+    sub = parser.add_subparsers(dest='command', help='Command')
+
+    sub.add_parser('status', help='Full mower status')
+    sub.add_parser('battery', help='Battery level')
+    sub.add_parser('gps', help='GPS position')
+    sub.add_parser('start', help='Start mowing')
+    sub.add_parser('stop', help='Stop mowing')
+    sub.add_parser('pause', help='Pause mowing')
+    sub.add_parser('resume', help='Resume mowing')
+    sub.add_parser('dock', help='Return to dock')
+    sub.add_parser('lock', help='Lock mower')
+    sub.add_parser('unlock', help='Unlock mower')
+
+    p_cfg = sub.add_parser('config', help='Show/set config')
+    p_cfg.add_argument('--key', dest='set_key', help='Config key to set')
+    p_cfg.add_argument('--value', dest='set_value', help='Config value to set')
+
+    sub.add_parser('maps', help='List maps')
+
+    p_export = sub.add_parser('map-export', help='Export map data')
+    p_export.add_argument('-o', '--output', help='Output filename')
+
+    p_hist = sub.add_parser('history', help='Task history')
+    p_hist.add_argument('-n', '--limit', type=int, default=10, help='Number of records')
+
+    sub.add_parser('notifications', help='Show notifications')
+
+    p_watch = sub.add_parser('watch', help='Live status polling')
+    p_watch.add_argument('-i', '--interval', type=int, default=30, help='Poll interval (seconds)')
+
+    p_mqtt = sub.add_parser('mqtt-info', help='MQTT broker info')
+    p_mqtt.add_argument('-e', '--export', help='Export certs to directory')
+
+    sub.add_parser('endpoints', help='List all known API endpoints')
+
+    p_raw = sub.add_parser('raw', help='Raw API request')
+    p_raw.add_argument('method', help='HTTP method')
+    p_raw.add_argument('endpoint', help='API endpoint')
+    p_raw.add_argument('-d', '--data', help='JSON body')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    email = args.email
+    password = args.password
+
+    if not email or not password:
+        print("❌ Need --email/--password or AIRSEEKERS_EMAIL/AIRSEEKERS_PASSWORD env vars")
+        sys.exit(1)
+
+    cli = TronCLI(email, password)
+
+    cmd_map = {
+        'status': cli.cmd_status,
+        'battery': cli.cmd_battery,
+        'gps': cli.cmd_gps,
+        'start': cli.cmd_task_start,
+        'stop': cli.cmd_task_stop,
+        'pause': cli.cmd_task_pause,
+        'resume': cli.cmd_task_resume,
+        'dock': cli.cmd_dock,
+        'lock': cli.cmd_lock,
+        'unlock': cli.cmd_unlock,
+        'config': cli.cmd_config,
+        'maps': cli.cmd_maps,
+        'map-export': cli.cmd_map_export,
+        'history': cli.cmd_history,
+        'notifications': cli.cmd_notifications,
+        'watch': cli.cmd_watch,
+        'mqtt-info': cli.cmd_mqtt_info,
+        'endpoints': cli.cmd_endpoints,
+        'raw': cli.cmd_raw,
+    }
+
+    async def run():
+        await cli.connect()
+        try:
+            await cmd_map[args.command](args)
+        finally:
+            await cli.close()
+
+    asyncio.run(run())
+
+
+if __name__ == "__main__":
+    main()
